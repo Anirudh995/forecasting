@@ -1,0 +1,524 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.linear_model import LogisticRegression,LinearRegression,LinearRegression
+from sklearn.neighbors import KNeighborsClassifier,KNeighborsRegressor
+from sklearn import metrics
+from sklearn.model_selection import train_test_split,GridSearchCV,cross_val_score,RandomizedSearchCV
+from sklearn.ensemble import RandomForestClassifier,RandomForestRegressor,AdaBoostRegressor,GradientBoostingRegressor,StackingRegressor
+from sklearn.metrics import accuracy_score,classification_report,confusion_matrix,f1_score,precision_score
+from sklearn.metrics import mean_squared_log_error
+from xgboost import XGBClassifier,XGBRegressor
+from sklearn.model_selection import GridSearchCV,cross_val_score,KFold
+from sklearn.metrics import accuracy_score,mean_squared_error,r2_score,mean_absolute_error,mean_absolute_error,mean_squared_log_error
+import lightgbm as lgb
+from bayes_opt import BayesianOptimization
+import GPy # needs numpy 1.20.0 for that numpy 1.19.5 need to be uninstalled which affects tensor flow
+import GPyOpt # needs numpy 1.20.0
+from GPyOpt.methods import BayesianOptimization as BO
+import os
+import xgboost as xgb
+import tensorflow as tf
+
+# Edit file location and forecast week
+Location = r"C:\Users\IN22917061\Downloads\Work documents\P01 March23\P01WK01_delivery"
+# Location = r"C:\Users\IN22917584\Downloads\CZ Sales Forcasting\Forecast Models\18th July\ADS_P04W18"
+
+
+# fcst_weeks = "P07W30_P10W44"
+# forecast_horizon = 15 # number of weeks
+# data_hist = "P07W29"
+
+
+fcst_weeks = "P01W01_P04W18"
+forecast_horizon = 18 # number of weeks
+data_hist = "P12W52"
+
+budget_sales_data = pd.read_csv("{}\\Model_output_format_Top19Depts_{}.csv".format(Location,fcst_weeks))
+
+
+main_data = pd.read_csv("Baby Care_metrics_sales_{}.csv".format(data_hist))
+dept_name = main_data['Dept'].unique()[0]
+
+main_data=main_data.rename(columns = {'tesco_period_weeknum_x': 'tesco_period_weeknum'})
+main_data=main_data.rename(columns = {'dmat_dep_des': 'Dept'})
+
+df_feat_1 = main_data[["tesco_period_weeknum", "sales_exc_vat"]]
+
+def lag_avg_calc(df_feat_created):    
+    df_feat_created['Lag_wk_1_sale'] = df_feat_created['sales_exc_vat'].shift(1) #pred sale
+#    df_feat_created['Lag_wk_2_sale'] = df_feat_created['sales_exc_vat'].shift(2)
+#    df_feat_created['Lag_wk_3_sale'] = df_feat_created['sales_exc_vat'].shift(3)
+#    df_feat_created['Avg_wk_2_sale'] = df_feat_created['sales_exc_vat'].rolling(2).mean().shift(1)
+#    df_feat_created['Avg_wk_3_sale'] = df_feat_created['sales_exc_vat'].rolling(3).mean().shift(1)
+    df_feat_created['Avg_wk_4_sale'] = df_feat_created['sales_exc_vat'].rolling(4).mean().shift(1)
+#     df_feat_created['min_wk_2'] = df_feat_created['sales_exc_vat'].rolling(2).min().shift(1)
+#     df_feat_created['min_wk_3'] = df_feat_created['sales_exc_vat'].rolling(3).min().shift(1)
+#     df_feat_created['min_wk_4'] = df_feat_created['sales_exc_vat'].rolling(4).min().shift(1)
+#     df_feat_created['max_wk_2'] = df_feat_created['sales_exc_vat'].rolling(2).max().shift(1)
+#     df_feat_created['max_wk_3'] = df_feat_created['sales_exc_vat'].rolling(3).max().shift(1)
+#     df_feat_created['max_wk_4'] = df_feat_created['sales_exc_vat'].rolling(4).max().shift(1)
+    df_feat_created['wk_on_wk_change'] = (df_feat_created['sales_exc_vat'].shift(1) - df_feat_created['sales_exc_vat'].shift(2))/df_feat_created['sales_exc_vat'].shift(2)
+
+
+    return(df_feat_created)
+    
+    df_base = lag_avg_calc(df_feat_1.copy())
+#df_base = df_base.dropna(axis=0)
+df_base['wk_on_wk_change'] = df_base['wk_on_wk_change'].fillna(-9999)
+df_base = df_base.dropna(axis=0)
+promo_to_sales_quantile = main_data.promo_sales/main_data.LFL_1year_sales
+promo_to_sales_quantile.quantile(q=[0.01, 0.25, 0.5, 0.75, 0.9,0.99,1])
+
+cols =[
+'promo_sales',
+'LFL_1year_sales_Baby_Care',
+'payday_ind',
+'easter',
+'valentines_day',
+'Lockdown_strict_mean',
+'promo_tpn_ratio']
+
+other_cols_df = main_data.loc[:,['tesco_period_weeknum', 'LFL_1year_sales']+cols]
+other_cols_df.columns
+
+df_subset_feat = df_base.merge(other_cols_df,on='tesco_period_weeknum')
+df_subset_feat.shape
+
+dev_time_frame = df_subset_feat.shape[0]-1-forecast_horizon
+dev_sample = df_subset_feat.loc[:dev_time_frame] #training till period09
+oot_sample = df_subset_feat.loc[dev_time_frame+1:]
+
+#train test split
+IV_cols = [x for x in dev_sample.columns if x != 'sales_exc_vat' and x!='tesco_period_weeknum']
+DV_cols = ['sales_exc_vat']
+len(IV_cols)
+
+
+####################################################################################################################################################
+
+def rfmodel_obj_func():
+    params = {'n_estimators' :[250,500],
+              'min_samples_leaf' :[1,2,4],
+              'min_samples_split' : [2, 4],
+             'bootstrap': [True,False], 
+             'max_depth' : [2,4,6],
+             'max_features': ['auto', 'log2','sqrt']}
+
+    rfmodel_obj = GridSearchCV(estimator=RandomForestRegressor(random_state=12),param_grid=params,cv=3,n_jobs=-1,return_train_score=True)
+    rfmodel_obj.fit(dev_sample[IV_cols],dev_sample[DV_cols].values.ravel())
+    return(rfmodel_obj)
+    
+########################################################################################################################################################
+
+def rfmodel_obj_bo_func():
+    bds = [{'name': 'n_estimators', 'type': 'discrete', 'domain': (200,800)},
+        {'name': 'min_samples_leaf', 'type': 'discrete', 'domain': (1,8)},
+        {'name': 'max_depth', 'type': 'discrete', 'domain': (1, 8)}]
+
+    # Optimization objective 
+    def cv_score(parameters):
+        parameters = parameters[0]
+        score = cross_val_score(
+                    RandomForestRegressor(random_state=12,
+                                  n_estimators=int(parameters[0]),
+                                  min_samples_leaf=int(parameters[1]),
+                                  max_depth=int(parameters[2])), 
+                                  dev_sample[IV_cols],
+                                  dev_sample[DV_cols],
+                                  scoring='neg_mean_squared_error').mean()
+        score = np.array(score)
+        return score
+
+    optimizer = BO(f=cv_score, 
+                     domain=bds,
+                     model_type='GP',
+                     acquisition_type ='EI',
+                     acquisition_jitter = 0.05,
+                     exact_feval=True, 
+                     maximize=True,
+                     random_state=12)
+
+    # Only 20 iterations because we have 5 initial random points
+    optimizer.run_optimization(max_iter=20)
+    
+    # Fix parameters
+    params_name = [dictionary['name'] for dictionary in bds]
+    params_bo_rf = dict(zip(params_name,optimizer.x_opt))
+
+    params_bo_rf['n_estimators']= [int(params_bo_rf['n_estimators'])]
+    params_bo_rf['min_samples_leaf'] = [int(params_bo_rf['min_samples_leaf'])]
+    params_bo_rf['max_depth']= [int(params_bo_rf['max_depth'])]
+
+    other_params = {'bootstrap': [True,False], 'max_features': ['auto', 'log2','sqrt']}
+
+    params_bo_rf_updated = {**params_bo_rf,**other_params}
+
+    # Fit the random forest regressor
+    rfmodel_obj_bo = GridSearchCV(estimator=RandomForestRegressor(random_state=12),param_grid=params_bo_rf_updated,cv=3,n_jobs=-1,return_train_score=True)
+    rfmodel_obj_bo.fit(dev_sample[IV_cols],dev_sample[DV_cols].values.ravel())
+    return(rfmodel_obj_bo)
+ ###########################################################################################################################################################
+ 
+ def xgb_grid_func():
+    # Various hyper-parameters to tune
+    xgb1 = XGBRegressor(random_state=9999)
+    parameters = {'nthread':[4], #when use hyperthread, xgboost may become slower
+                  'objective':['reg:squarederror'],
+                  'learning_rate': [0.03, 0.05, 0.01], #so called `eta` value
+                  'max_depth': [1,2,4],
+                  'min_child_weight': [2,4],
+    #               'silent': [1],
+                  'subsample': [0.7],
+                  'colsample_bytree': [0.7],
+                  'n_estimators': [500]}
+
+    xgb_grid = GridSearchCV(xgb1,
+                            parameters,
+                            cv = 2,
+                            n_jobs = 5,
+                            verbose=False,
+                            scoring="neg_mean_absolute_error") # try with "neg_mean_squared_error"
+
+    xgb_grid.fit(dev_sample[IV_cols],dev_sample[DV_cols].values.ravel())
+    return(xgb_grid)
+ ############################################################################################################################################################
+ xg_bo_params = ['objective','colsample_bytree', 'gamma', 'learning_rate', 'max_depth', 'min_child_weight', 'n_estimators', 'subsample']
+ def xgb_bo_func():
+    warnings.filterwarnings(action="ignore", message=r'.*Use subset.*of np.ndarray is not recommended')
+    dtrain = xgb.DMatrix(data=dev_sample[IV_cols],label=dev_sample[DV_cols])
+    pbounds = {'max_depth': (3, 10),
+              'gamma': (0, 1),
+              'learning_rate':(0.01,0.9),
+              'n_estimators':(100,750),
+              'subsample' :(0.2,0.5),
+              'min_child_weight' : (0,10),
+              'colsample_bytree' : (0.1,0.99)
+
+             }
+    def bo_tune_xgb(max_depth, gamma, n_estimators ,learning_rate,subsample, min_child_weight,colsample_bytree):
+        params = {'objective':'reg:squarederror',
+                  'max_depth': int(max_depth),
+                  'gamma': gamma,
+    #               'n_estimators': int(n_estimators), # shows warning, bu default it takes values from pbound - so no issue
+                  'learning_rate':learning_rate,
+                  'subsample': subsample, #0.8,
+                  'min_child_weight' : int(min_child_weight),
+                  'colsample_bytree' : colsample_bytree,
+                  'eta': 0.1,
+                  'eval_metric': 'rmse'
+                  }
+        #Cross validating with the specified parameters in 5 folds and 70 iterations , read on early_stooping and eavl_set'
+        cv_result = xgb.cv(params, dtrain, nfold=5,num_boost_round=100,as_pandas=True,metrics='rmse',seed=2000,maximize=False)
+        #Return the negative RMSE or MAE as it will minimize the objective function or the error metrics
+        return -1.0 * cv_result['test-rmse-mean'].iloc[-1]
+
+    #Invoking the Bayesian Optimizer with the specified parameters to tune
+    xgb_bo = BayesianOptimization(f=bo_tune_xgb,pbounds=pbounds, random_state=100,verbose=None) # to print verbose=2
+
+    gp_params = {"alpha": 1e-4}
+
+    #performing Bayesian optimization for 5 iterations with 8 steps of random exploration with an #acquisition function of expected improvement
+    xgb_bo.maximize(n_iter=5, init_points=8, acq='ei',**gp_params)
+
+    params_bo = xgb_bo.max['params']
+
+    #Converting the max_depth and n_estimator values from float to int
+    params_bo['max_depth']= int(params_bo['max_depth'])
+    params_bo['n_estimators']= int(params_bo['n_estimators'])
+
+    # Fit the xgb regressor model
+    xgb_bo = XGBRegressor(random_state=9999,**params_bo)
+    xgb_bo.fit(dev_sample[IV_cols],dev_sample[DV_cols].values.ravel())
+    return(xgb_bo)
+   ###############################################################################################################################################################
+def xgb_bo_gp_func():
+    np.random.seed(9999)
+    bds = [{'name': 'learning_rate', 'type': 'continuous', 'domain': (0.01, 0.9)},
+            {'name': 'gamma', 'type': 'continuous', 'domain': (0, 8)},
+            {'name': 'max_depth', 'type': 'discrete', 'domain': (1, 10)},
+            {'name': 'n_estimators', 'type': 'discrete', 'domain': (100, 1000)},
+            {'name': 'min_child_weight', 'type': 'discrete', 'domain': (1, 10)},
+            {'name': 'subsample', 'type': 'continuous', 'domain': (0.1, 0.99)},
+            {'name': 'colsample_bytree', 'type': 'continuous', 'domain': (0.1, 0.99)}] 
+
+    # Optimization objective 
+    def cv_score(parameters):
+        parameters = parameters[0]
+        score = cross_val_score(
+                    XGBRegressor(random_state=9999,
+                                  learning_rate=parameters[0],
+                                  gamma=int(parameters[1]),
+                                  max_depth=int(parameters[2]),
+                                  n_estimators=int(parameters[3]),
+                                  min_child_weight = parameters[4],
+                                  subsample = parameters[5],
+                                  colsample_bytree = parameters[6]), 
+                                  dev_sample[IV_cols],
+                                  dev_sample[DV_cols], 
+                                  scoring='neg_mean_squared_error').mean()
+        score = np.array(score)
+        return score
+
+    optimizer = BO(f=cv_score, 
+                     domain=bds,
+                     model_type='GP',
+                     acquisition_type ='EI',
+                     acquisition_jitter = 0.05,
+                     exact_feval=True, 
+                     maximize=True,
+                     random_state=9999)
+
+    # Only 20 iterations because we have 5 initial random points
+    optimizer.run_optimization(max_iter=20)
+
+    # Best parameter settings
+    params_name = [dictionary['name'] for dictionary in bds]
+    params_bo_gp = dict(zip(params_name,optimizer.x_opt))
+    params_bo_gp['max_depth']= int(params_bo_gp['max_depth'])
+    params_bo_gp['n_estimators']= int(params_bo_gp['n_estimators'])
+    # params_bo_gp['gamma'] = int(params_bo_gp['gamma'])
+    print(params_bo_gp)
+    # Fit the xgb regressor model
+    xgb_bo_gp = XGBRegressor(random_state=9999,**params_bo_gp)
+    xgb_bo_gp.fit(dev_sample[IV_cols],dev_sample[DV_cols].values.ravel())
+    return(xgb_bo_gp)
+    
+ ####################################################################################################################################################
+def lgbmodel_obj_func():
+    params = {"n_estimators": [200,300],
+              "learning_rate": [0.01, 0.1],
+              "num_leaves": [2,4],##It specifies the number of leaves in a tree. It should be smaller than the square of max_depth.
+              "max_depth": [3,4,5]}
+#         "lambda_l1": [ 0, 50],
+#         "lambda_l2": [ 0, 50],
+#         "min_gain_to_split": [0, 15],
+#         "bagging_fraction": [0.2, 0.95],
+#         "feature_fraction": [ 0.2, 0.95]}
+    lgbmodel_obj = GridSearchCV(estimator=lgb.LGBMRegressor(random_state=100),param_grid=params,cv=3,n_jobs=1,return_train_score=True)
+    lgbmodel_obj.fit(dev_sample[IV_cols],dev_sample[DV_cols].values.ravel())
+    return(lgbmodel_obj) 
+#####################################################################################################################################################
+
+rfmodel_obj = tuple()
+rfmodel_obj_bo = tuple()
+xgb_grid = tuple()
+xgb_bo = tuple()
+xgb_bo_gp = tuple()
+lgbmodel_obj = tuple()
+
+# # #1.1 ---------- RF
+rfmodel_obj = rfmodel_obj_func()
+# # # 1.2
+rfmodel_obj_bo = rfmodel_obj_bo_func()
+
+# # 2.1 -------------- XG
+xgb_grid = xgb_grid_func()
+# # 2.2
+xgb_bo = xgb_bo_func()
+# # 2.3
+xgb_bo_gp = xgb_bo_gp_func()
+
+lgbmodel_obj = lgbmodel_obj_func()
+
+model_object_all = {'RF' : rfmodel_obj, "RF_BO":rfmodel_obj_bo,
+                    "XG":xgb_grid, "XG_BO":xgb_bo, "XG_BO_GP":xgb_bo_gp,
+                    'LGB' : lgbmodel_obj}
+model_object = {keys : values for keys,values in model_object_all.copy().items() if type(values).__name__ != "tuple"}
+model_object_all = None
+
+df_feat_bkup = dev_sample[['tesco_period_weeknum','sales_exc_vat']]
+row_num = dev_sample.shape[0]
+
+timeframe_list =  oot_sample['tesco_period_weeknum'].head(forecast_horizon).tolist() #['20211040','20211041','20211042','20211043','20211044']
+# model_names, model_type
+final_pred_df_all_algo = pd.DataFrame()
+#print(df_feat_bkup.info())
+for idx, (model_names, model_type) in enumerate(model_object.items()):
+    model_predict_df = df_feat_bkup.copy()
+    
+    for counter in range(len(timeframe_list)):
+        #print(df_feat_bkup.info())
+        model_predict_df.loc[row_num + counter] = np.array([timeframe_list[counter], np.NAN]) #creates indep with sales as nan
+#         print(model_predict_df.tail(5))
+        model_predict_df['sales_exc_vat'] = model_predict_df['sales_exc_vat'].astype(float)
+#         print(model_predict_df.tail(5))
+#         #print(model_predict_df.tail(4))
+        #print("--- end ----")
+#         #print(df_feat_bkup.info())
+#         #print("--------------")
+
+        df_feat_bkup_2 = lag_avg_calc(model_predict_df[["tesco_period_weeknum", "sales_exc_vat"]])
+        
+#         print(df_feat_bkup_2.info())
+#         #print("********")
+        
+        df_feat_bkup_2 = df_feat_bkup_2.merge(other_cols_df,on='tesco_period_weeknum') #adding other cols 
+        #display(df_feat_bkup_2.tail())
+    
+#         #     predict function by using tail
+        #df_feat_bkup_2['wk_on_wk_change'] = df_feat_bkup_2['wk_on_wk_change'].fillna(-99999)
+        df_feat_bkup_2 = df_feat_bkup_2.fillna(0)
+        #display(df_feat_bkup_2.tail())
+        
+        model_pred = model_type.predict(df_feat_bkup_2[IV_cols].tail(1)) 
+        #print(model_pred)
+        model_predict_df.loc[row_num + counter] = np.array([timeframe_list[counter], model_pred[0]])
+        #display(model_predict_df.tail(5))
+        
+    if idx <=0: 
+        model_predict_df.rename(columns = {model_predict_df.columns[1] : model_names}, inplace=True)
+        final_pred_df_all_algo = model_predict_df
+#         display(model_predict_df.tail(10))
+#         display(final_pred_df_all_algo.tail(10))
+        print("loop 0")
+    else:
+        model_predict_df.rename(columns = {model_predict_df.columns[1] : model_names}, inplace=True)
+        final_pred_df_all_algo = pd.merge(final_pred_df_all_algo, model_predict_df, left_on= "tesco_period_weeknum",right_on="tesco_period_weeknum", how="left" )
+#         display(model_predict_df.tail(5))
+#         display(final_pred_df_all_algo.tail(5))
+        print("loop another")
+        #pd.concat([final_pred_df_all_algo, model_predict_df], axis =0)
+
+#     df_feat_bkup.loc[row_num + counter] = np.array([timeframe_list[counter], prediction_tail[counter]])
+    #print(df_feat_bkup.tail(4))'''
+final_prediction_oot = pd.merge(oot_sample[["tesco_period_weeknum","sales_exc_vat"]], 
+                                final_pred_df_all_algo, 
+                                on= "tesco_period_weeknum",
+                                how="inner" )
+# final_prediction_oot = final_prediction_oot[["tesco_period_weeknum","sales_exc_vat", "pred"]]
+
+#for deployment 
+budget_sales_data_dept_level = budget_sales_data[budget_sales_data["Dept"] == dept_name]
+budget_sales_subset_data = budget_sales_data_dept_level[["tesco_period_weeknum","Budget_Sales"]]
+
+
+
+budget_sales_as_actual_sales = pd.merge(final_prediction_oot,budget_sales_subset_data,on=["tesco_period_weeknum"], how="left")
+
+
+
+budget_sales_as_actual_sales['New_Sales_Exc_v1'] = np.where(budget_sales_as_actual_sales['sales_exc_vat']>1000,
+         budget_sales_as_actual_sales['sales_exc_vat'],budget_sales_as_actual_sales['Budget_Sales'])
+# display(budget_sales_as_actual_sales)
+budget_sales_as_actual_sales.drop(['sales_exc_vat',"Budget_Sales"],axis=1, inplace=True)
+
+
+
+budget_sales_as_actual_sales.insert(1,"sales_exc_vat",budget_sales_as_actual_sales["New_Sales_Exc_v1"])
+
+
+
+final_prediction_oot = budget_sales_as_actual_sales.drop(["New_Sales_Exc_v1"], axis=1)
+
+
+
+df = final_prediction_oot.copy()
+for model_names in  model_object.keys():
+    df["variance_{}".format(model_names)] = (df[model_names]-df['sales_exc_vat'])/1000000
+
+
+
+for model_names in  model_object.keys():
+    df["accuracy_{}".format(model_names)] = (1-abs((df[model_names]-df['sales_exc_vat'])/df['sales_exc_vat']))
+    
+def plot_feature_importance(importance,names,model_type):
+
+    #Create arrays from feature importance and feature names
+    feature_importance = np.array(importance)
+    feature_names = np.array(names)
+
+    #Create a DataFrame using a Dictionary
+    data={model_type+"_"+'Features':feature_names,model_type+ "_" +'Feat_Imp':feature_importance}
+    fi_df = pd.DataFrame(data)
+
+    #Sort the DataFrame in order decreasing feature importance
+    fi_df.sort_values(by=[model_type+"_" +'Feat_Imp'], ascending=False,inplace=True)
+    fi_df.reset_index(drop=True, inplace=True)
+#     display(fi_df)
+    #Define size of bar plot -> plt.figure(figsize=(10,8))
+
+    #Plot Searborn bar chart
+    sns.barplot(y=fi_df[model_type+"_" +'Feat_Imp'], x=fi_df[model_type+"_"+'Features'])
+    
+    #Add chart labels
+    plt.title(model_type + ' - FEATURE IMPORTANCE')
+    plt.xlabel('FEATURE NAMES')
+    plt.xticks(rotation=90)
+    plt.ylabel('FEATURE IMPORTANCE')
+    return(fi_df)
+variable_imp_list = list()
+for model_names in model_object.keys():
+    try:
+        df = plot_feature_importance(model_object[model_names].best_estimator_.feature_importances_,
+                                    dev_sample[IV_cols].columns,model_names)
+    except:
+        df = plot_feature_importance(model_object[model_names].feature_importances_,
+                                    dev_sample[IV_cols].columns,model_names)
+
+    cols = df.columns[1]
+    if df[cols].dtypes == np.integer:
+        df[cols] = (df[cols] / df[cols].sum())
+
+    variable_imp_list.append(df)
+
+columns_order = df_subset_feat.drop(['tesco_period_weeknum', 'sales_exc_vat'], axis=1)
+column_order_df = pd.DataFrame(columns_order.columns)
+column_order_df.columns = ["Column_Order"]
+
+all_model_feat_importance = pd.concat(variable_imp_list,axis=1)
+all_model_feat_importance = pd.concat([column_order_df,all_model_feat_importance], axis=1)
+all_model_feat_importance.insert(0,'Dept',dept_name)
+
+params_list = list()
+for model_names in model_object.keys():
+    try:
+        params_list.append(pd.DataFrame([model_object[model_names].best_params_]).T) 
+    except:
+        params_universe_v1 = model_object[model_names].get_xgb_params()
+        params_universe = {**params_universe_v1,
+                              **{'n_estimators' : model_object[model_names].n_estimators}}
+        params_xg_bo = dict((params, params_universe[params]) 
+                       for params in params_universe.keys() if params in xg_bo_params) 
+        params_list.append(pd.DataFrame([params_xg_bo]).T)
+
+algos_params = pd.concat(params_list, axis=1).reset_index()
+algos_params.insert(0,'Dept',dept_name)
+algos_params.columns = ["Dept"]+["Params"] + list(model_object.keys())
+
+final_forecast = final_prediction_oot[["tesco_period_weeknum"] + list(model_object.keys())]
+# final_forecast = final_prediction_oot.iloc[0:,[0,2,3,4]]
+#final_forecast =final_forecast[final_forecast['tesco_period_weeknum']>=20220624]
+final_forecast['Dept'] = dept_name
+# final_forecast.to_csv("forecast_" + dept_name + "_" + fcst_weeks + ".csv", index=False)
+writer = pd.ExcelWriter("{}\\forecast_{}_{}.xlsx".format(Location,dept_name,fcst_weeks), engine ='xlsxwriter')
+final_forecast.to_excel(writer, sheet_name =dept_name+"_fcst",index=False)
+all_model_feat_importance.to_excel(writer, sheet_name =dept_name+"_varimp",index=False)
+algos_params.to_excel(writer, sheet_name =dept_name+"_params",index=False)
+writer.save()
+
+# Function to export the forecast data (each sheet has forecast for each dept)
+
+def forecast_xls(excel_df,column_name,forecast_weeks):
+    dept_names = excel_df[column_name].unique().tolist()
+    writer = pd.ExcelWriter('{}\\Consolidated_Forecast_{}.xlsx'.format(Location,forecast_weeks), engine ='xlsxwriter')
+    for dept in dept_names:
+        try:    
+            forecast_data_pull = pd.read_excel("{}\\forecast_{}_{}.xlsx".format(Location,dept,fcst_weeks), 
+                                               sheet_name=dept+"_fcst")
+            filter_dept_df = excel_df[excel_df[column_name]==dept]
+            filter_dept_df = pd.merge(filter_dept_df, forecast_data_pull, 
+                                      left_on= ["tesco_period_weeknum","Dept"],
+                                      right_on=["tesco_period_weeknum","Dept"], how="inner")
+            filter_dept_df = filter_dept_df.reset_index(drop=True)
+            filter_dept_df.to_excel(writer, sheet_name =dept,index=False)
+        except Exception as e:
+            print("Dept " + dept +" - not found")
+    writer.save()#function calldept_metrics_sales_data = pd.read_pickle("Model_output_format.pkl")
+    
+forecast_xls(excel_df=budget_sales_data, # master ADS for the forecast prepared
+             column_name="Dept", #column name having department names
+             forecast_weeks=fcst_weeks)
